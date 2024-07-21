@@ -1,0 +1,538 @@
+---
+title: "External validation of the CFS tool in a hospitalised elderly population"
+output:
+  html_document:
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+This is an external validation of the Clinical Frailty Score (CFS) in a hospitalised and potentially frail elderly population. The purpose of an external validation is to determine whether a tool is useful in a different population to the one it was developed for. In this case, our research question was whether the CFS was useful in a hospitalised elderly population for predicting 90-day mortality. Given that the population is substantially older, we were also interested in whether adding age as a predictor was able to improve the model's predictions. The research plan has been approved using dummy data and will measure the following components:\
+
+* Model discrimination, or whether the model assigned higher risks to patients who died\
+* Model calibration, or whether the model accurately predicts the expected number of deaths\
+* Model fit with and without age as a predictor\
+* The net benefit of using the models\
+* The stability of predictions from the models\
+
+```{r, message = FALSE, warning = FALSE}
+library(ggthemes)
+library(extrafont)
+library(remotes)
+library(rms)
+library(CalibrationCurves)
+library(dcurves)
+library(survival)
+library(survminer)
+library(flextable)
+library(patchwork)
+library(viridis)
+library(tidyverse)
+
+options(scipen = 100, digits = 5)
+loadfonts(quiet = T)
+```
+
+# Data preparation
+
+## Sample size calculations
+A preliminary sample size calculation is required to determine whether we have sufficient data to evaluate the model. A simple implementation has been published by Riley and colleagues: https://doi.org/10.1002/sim.9025 through the `pmsampsize` package. 
+
+We will conservatively estimate that we need up to 4 parameters in the model for an event with a prevalence of around 20%. Prior external validations of the CFS are unpromising, with a c-statistic, or area under the receiver operating characteristic curve, of 0.58: https://doi.org/10.1093/ageing/afac334
+
+```{r}
+pmsampsize::pmsampsize(
+  type = "b",
+  parameters = 5,
+  prevalence = 0.2,
+  cstatistic = 0.6
+)
+```
+
+The package suggests a sample size of at least 2260 observations with 452 deaths. 
+A quick survey of our data shows that we are OK.
+
+## Preliminary analysis of mortality in our population
+We can take a quick look at the survival rate of patients given their CFS scores to determine how unwell our population is and, at a glance, how well the CFS can stratify them.
+
+```{r, echo = FALSE, warning = FALSE}
+
+# This is how deidentified dataset was created for public repository:
+# load("./analysis_ready.RData")
+# df_pred <- analysis |>
+#   mutate(death_90d = ifelse(
+#     difftime(death_date, admit_date, units = "days") > 90 | is.na(death_date),
+#     0,
+#     1
+#   )) |>
+#   as_tibble()
+# save(df_pred, file = "deidentified_data.RData")
+load("./deidentified_data.RData")
+
+# Including how data was created was for the survival model:
+# lastday <- max(analysis$death_date, na.rm = T)
+# df_surv <- analysis |>
+#   mutate(
+#     time = ifelse(is.na(death_date),
+#       lastday - admit_date,
+#       death_date - admit_date
+#     ),
+#     event = ifelse(is.na(death_date), 0, 1),
+#     death_90d = ifelse(
+#     difftime(death_date, admit_date, units = "days") > 90 | is.na(death_date), 
+#     0,
+#     1
+#     )
+#   ) |>
+#   select(-c(participant_id, sex, fclty_name, study_period, admit_start_date_time, admit_date,
+#             person_id, death_date))
+# save(df_surv, file = "deidentified_survival_data.RData")
+
+load("./deidentified_survival_data.RData")
+
+fit_surv <- survfit(Surv(time = time, event = event) ~ cristal_cfs_score, data = df_surv)
+legend_labels <- paste0(seq(1, 9, 1), " (n = ", fit_surv$n, ")")
+
+colours <- rev(viridis(9))
+
+ggsurv <- ggsurvplot(fit_surv,
+  data = df_surv,
+  palette = colours,
+  alpha = 0.95,
+  break.x.by = 90,
+  legend.labs = legend_labels,
+  legend.title = "CFS score",
+  xlab = "Time in days since hospital admission",
+  censor.size = 2,
+  ggtheme = theme_bw()
+)
+
+ggsurv$plot + 
+  geom_vline(xintercept = 90, linetype = "dashed") +
+  theme(panel.grid.minor = element_blank()) +
+  annotate("label", label = 1, x = 385, y = 0.51, colour = colours[1]) +
+  annotate("label", label = 2, x = 401, y = 0.84, colour = colours[2]) +
+  annotate("label", label = 3, x = 400, y = 0.76, colour = colours[3]) +
+  annotate("label", label = 4, x = 402, y = 0.68, colour = colours[4]) +
+  annotate("label", label = 5, x = 401, y = 0.56, colour = colours[5]) +
+  annotate("label", label = 6, x = 402, y = 0.62, colour = colours[6]) +
+  annotate("label", label = 7, x = 399, y = 0.47, colour = colours[7]) +
+  annotate("label", label = 8, x = 401, y = 0.24, colour = colours[8]) +
+  annotate("label", label = 9, x = 150, y = 0.12, colour = colours[9])
+
+ggsave("./Figure1.jpg", height = 6, width = 7)
+remove(df_surv, fit_surv, ggsurv, colours, legend_labels)
+```
+
+## Missing data
+We also have a handful of missing values in our dataset for the CFS score. We are, at least, confident that our age and outcome variables are reliable.
+
+```{r}
+paste0(sum(is.na(df_pred$cristal_cfs_score)), " missing CFS values")
+```
+
+These will have to be imputed. Because so few data points are missing (<1% of the data) and we are not aware of any factors that could influence missingness, we should be OK with single imputation.
+
+```{r}
+imp <- aregImpute(
+  ~ spict_score + cristal_cfs_score + cristal_score_1 + cristal_score_2 + cristal_score +
+    age_on_admission + death_90d,
+  data = df_pred,
+  n.impute = 1
+)
+df_pred$cristal_cfs_score[is.na(df_pred$cristal_cfs_score)] <- imp$imputed$cristal_cfs_score
+remove(imp)
+paste0(sum(is.na(df_pred$cristal_cfs_score)), " missing CFS values")
+```
+
+## Turning CFS values into predicted probabilities
+CFS scores may correspond to something in clinical care, but we need to turn them into probabilities to make them evaluable by other metrics like calibration. The easiest way to do this is to fit a simple logistic regression model with 90-day mortality as our outcome and CFS as our sole predictor.
+
+```{r}
+dd <- datadist(df_pred)
+options(datadist = dd)
+fit <- lrm(death_90d ~ cristal_cfs_score, data = df_pred)
+df_pred$pred <- predict(fit, type = "fitted")
+ggplot(Predict(fit))
+```
+
+# Model evaluation
+Now that our data are prepared for analysis, we can assess the CFS properly. This can be done first using discrimination, or the ability of the model to assign higher risk scores to patients who died, and calibration, or the ability of the model to assign risks that are proportional to the observed rate of death in our population.
+
+```{r, echo = FALSE}
+p2 <- valProbggplot(
+  p = df_pred$pred,
+  y = df_pred$death_90d,
+  logit = "p",
+  d0lab = NULL,
+  d1lab = NULL,
+  line.bins = 0,
+  length.seg = 0,
+  statloc = c(0.65, 0.2),
+  xlim = c(0,1),
+  ylim = c(0,1),
+  dostats = FALSE
+)
+
+p2 # Model performance
+auc <- p2$Cindex # Closed form 0.95 interval for AUC
+```
+
+This plot shows us that the discrimination of the model is around 0.62 [0.60, 0.64], which is not particularly good, given that the c-statistic ranges from 0.5 (no better than random chance) to 1 (perfectly separates patients who died and survived). The calibration of the model is also OK for the majority of CFS scores up to around 7, but CFS scores of 8 and 9 tend to dramatically underestimate risk (the observed mortality rate for these patients rises much faster than the predicted probabilities).
+
+# Modifying the CFS: Does the addition of age improve model performance?
+
+We can test whether age improves the model by repeating the above process. The best way to check whether the new model does a better job of explaining our data is through the likelihood ratio Chi-squared test. First though, we should assess whether the effect of age on our predictions is roughly linear.
+
+```{r, echo = FALSE}
+fit2 <- lrm(death_90d ~ cristal_cfs_score + age_on_admission, data = df_pred)
+fit_test <- lrm(death_90d ~ cristal_cfs_score + rcs(age_on_admission, 3), data = df_pred)
+ggplot(Predict(fit_test))
+anova(fit_test)
+remove(fit_test)
+```
+
+Adding a non-linear transformation of age to the model appears to be unwarranted, which means that the effect of age is roughly linear in our population. We can just use an untransformed variable to fit our model. Now we can run the LR test.
+
+```{r, echo = FALSE}
+df_pred$pred2 <- predict(fit2, type = "fitted")
+lrtest(fit, fit2)
+```
+
+This result suggests that we may get better predictions from the new model compared to the old model. However, we still need to test that idea.
+
+```{r, echo = FALSE}
+p3 <- valProbggplot(
+  p = df_pred$pred2,
+  y = df_pred$death_90d,
+  logit = "p",
+  d0lab = NULL,
+  d1lab = NULL,
+  line.bins = 0,
+  length.seg = 0,
+  statloc = c(0.65, 0.2),
+  xlim = c(0,1),
+  ylim = c(0,1),
+  dostats = FALSE
+)
+
+p3 # Model performance
+auc2 <- p3$Cindex # Closed form 0.95 interval for AUC
+```
+
+This appears to be marginally better. The c-statistic isn't much higher (0.63 [0.61, 0.65]), and the risk underestimation has been slightly toned down for higher CFS scores. 
+
+We can also see a much more widely distributed set of risks in the histograms of the two models predictions.
+
+
+```{r, echo = FALSE, message = FALSE}
+df_pred <- df_pred |>
+  mutate(
+    `CFS alone` = pred,
+    `CFS + age` = pred2
+  )
+
+p4 <- df_pred |> ggplot()
+p4 +
+  geom_histogram(aes(x = `CFS alone`, fill = "CFS alone"), alpha = 0.5) +
+  geom_histogram(aes(x = `CFS + age`, fill = "CFS + age"), alpha = 0.5) +
+  scale_fill_manual(values = c("#56B4E9", "#E69F00")) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank()) +
+  theme(legend.position = "bottom") +
+  theme(legend.title = element_blank()) +
+  labs(
+    x = "Predicted probabilities",
+    y = "Number of observations"
+  )
+```
+
+Assessing the value of the models using net benefit is a good way to determine the appropriate thresholds one might use for decision-making. In the case of the CFS, we may use it in this population to decide who to review for palliative care, or discussion of advanced directives.
+
+```{r, echo = FALSE}
+dca(death_90d ~ `CFS alone` + `CFS + age`, data = df_pred) |> plot(smooth = TRUE)
+```
+
+
+There appears to be a marginal benefit of using the CFS, but not much changes by adding age. The net benefit plot shows that the gains identified by using the CFS in our population occur predominantly around the lower to middle set of predicted probabilities. These correspond to CFS scores of around 5 to 7.
+
+# Post-hoc analysis
+We observed non-linearity in the relationship between CFS score and 90-day mortality. As a post-hoc analysis, we investigated whether it may be more appropriate to fit a non-linear term for CFS in the model. 
+
+```{r}
+fit3 <- lrm(death_90d ~ rcs(cristal_cfs_score, 5) + age_on_admission, data = df_pred)
+ggplot(Predict(fit3))
+anova(fit3)
+lrtest(fit3, fit2)
+```
+
+The Wald test demonstrates a strongly non-linear relationship. Running model discrimination and calibration statistics again could show an interesting result:
+
+```{r, echo = FALSE}
+df_pred$pred3 <- predict(fit3, type = "fitted")
+p5 <- valProbggplot(
+  p = df_pred$pred3,
+  y = df_pred$death_90d,
+  logit = "p",
+  d0lab = NULL,
+  d1lab = NULL,
+  line.bins = 0,
+  length.seg = 0,
+  statloc = c(0.65, 0.2),
+  xlim = c(0,1),
+  ylim = c(0,1),
+  dostats = FALSE
+)
+
+p5
+auc3 <- p5$Cindex
+
+p5$ggPlot + 
+  ggtitle("Predictive performance of Model 4: CFS (non-linear) + age (linear)", 
+          subtitle = "c-statistic = 0.63 [0.61, 0.65]") +
+  geom_hline(yintercept = 0, colour = "#999999", linewidth = 1) +
+  theme(panel.grid.major = element_line(colour = "#999999", linewidth = 0.2)) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+  theme(legend.position = "bottom") +
+  annotate(geom = "text",
+           label = "Model underestimates risks",
+           x = 0.2, y = 0.9) +
+  annotate(geom = "text",
+           label = "Model overestimates risks",
+           x = 0.8, y = 0.1)
+```
+
+
+Combining all three model performance plots to make them publication ready:
+```{r}
+(p2$ggPlot + 
+  ggtitle("Model 1: CFS alone (linear)", 
+          subtitle = "c-statistic = 0.62 [0.60, 0.64]") +
+  geom_hline(yintercept = 0, colour = "#999999", linewidth = 1) +
+  theme(legend.position = "none") +
+  theme(panel.grid.major = element_line(colour = "#999999", linewidth = 0.2)) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+  annotate(geom = "text",
+           label = "Model underestimates risks",
+           x = 0.22, y = 0.9) +
+  annotate(geom = "text",
+           label = "Model overestimates risks",
+           x = 0.8, y = 0.1)) /
+  (p3$ggPlot +
+  ggtitle("Model 2: CFS (linear) + age (linear)",
+          subtitle = "c-statistic = 0.63 [0.61, 0.65]") +
+  geom_hline(yintercept = 0, colour = "#999999", linewidth = 1) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+  theme(panel.grid.major = element_line(colour = "#999999", linewidth = 0.2)) +
+  theme(legend.position = "none") +
+  annotate(geom = "text",
+           label = "Model underestimates risks",
+           x = 0.22, y = 0.9) +
+  annotate(geom = "text",
+           label = "Model overestimates risks",
+           x = 0.8, y = 0.1)) /
+  p5$ggPlot + 
+  ggtitle("Model 4: CFS (non-linear) + age (linear)", 
+          subtitle = "c-statistic = 0.63 [0.61, 0.65]") +
+  geom_hline(yintercept = 0, colour = "#999999", linewidth = 1) +
+  theme(panel.grid.major = element_line(colour = "#999999", linewidth = 0.2)) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+  theme(legend.position = "bottom") +
+  annotate(geom = "text",
+           label = "Model underestimates risks",
+           x = 0.22, y = 0.9) +
+  annotate(geom = "text",
+           label = "Model overestimates risks",
+           x = 0.8, y = 0.1)
+
+ggsave("./Figure2.png", height = 10, width = 5)
+
+```
+
+While the c-statistic appears unchanged, the calibration is now significantly improved. Demonstration of the form of the coefficients appears to confirm the non-linearity of the CFS in terms of its relationship with 90-day mortality.
+
+This suggests that the CFS in its unmodified form may suffer from poor calibration, but this issue can be improved by transforming the CFS score and adjusting for patient age. We can repeat the histogram to check the predictions for this new model.
+
+```{r, echo = FALSE, message = FALSE}
+df_pred <- df_pred |>
+  mutate(
+    `Non-linear CFS + age` = pred3
+  )
+
+p6 <- df_pred |>
+  select(participant_id, `CFS alone`, `CFS + age`, `Non-linear CFS + age`) |>
+  pivot_longer(!participant_id, names_to = "Model", values_to = "Prediction") |>
+  mutate(Model = factor(x = Model, levels = c("CFS alone", "CFS + age", "Non-linear CFS + age"))) |>
+  ggplot()
+
+p6 +
+  geom_histogram(aes(x = Prediction), alpha = 0.7, fill = "#56B4E9") +
+  facet_wrap(vars(Model)) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank()) +
+  theme(legend.position = "bottom") +
+  theme(legend.title = element_blank()) +
+  labs(
+    x = "Predicted probabilities of death within 90 days",
+    y = "Number of observations"
+  )
+ggsave("./Figure3.png", height = 5, width = 6)
+```
+
+We can also, finally, just check whether the net benefit is improved with this model.
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+
+as_tibble(dca(death_90d ~ `CFS alone` + `CFS + age` + `Non-linear CFS + age`, data = df_pred)) |>
+  dplyr::filter(!is.na(net_benefit)) |>
+  ggplot(aes(x = threshold, y = net_benefit, color = label)) +
+  geom_line(stat = "smooth", 
+            method = "loess", 
+            se = FALSE, 
+            formula = "y ~ x", 
+            span = 0.2, 
+            linewidth = 1.2, 
+            alpha = 0.5) +
+  coord_cartesian(ylim = c(-0.0206078896313861, 0.206078896313861)) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_colour_manual(values = rev(viridis(5))) +
+  labs(x = "Threshold Probability", y = "Net Benefit", color = "") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank()) +
+  theme(legend.position = c(0.8, 0.7)) +
+  guides(color = guide_legend(title = "Model")) +
+  annotate("text", label = "Using model beneficial",
+           x = 0.5, y = 0.03) +
+  annotate("text", label = "Using model not beneficial",
+           x = 0.5, y = -0.02)
+
+ggsave("./Figure4.png", height = 6, width = 6)
+```
+
+Net benefit appears to be marginally better.
+
+
+# Checking the stability of models developed in our population
+When developing or externally validating clinical prediction models, it often pays to make sure that the predicted risks are not unduly influenced by random variation in the sample population. This can be done through checking model instability, or the degree to which the predicted risks change. As we have many patients, a high number of events, and an extremely parsimonious model (one or two predictors at most), this is unlikely to be a problem, but we'll check anyway.
+
+The best way to do this is actually just to repeat the entire model fitting process.
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+B <- 200
+N <- nrow(df_pred)
+boot <- list()
+
+for (i in 1:(B - 1)) {
+  # Sample data N times with replacement, where N = number of observations
+  df0 <- df_pred[sample(N, N), ]
+
+  # Singly impute
+  boot_imp <- aregImpute(
+    ~ spict_score + cristal_cfs_score + cristal_score_1 +
+      cristal_score_2 + cristal_score + age_on_admission +
+      + death_90d,
+    data = df0,
+    n.impute = 1,
+    pr = F
+  )
+
+  # Fit new models
+  boot_fit1 <- lrm(death_90d ~ cristal_cfs_score, data = df0)
+  boot_fit2 <- lrm(death_90d ~ cristal_cfs_score + age_on_admission, data = df0)
+  boot_fit3 <- lrm(death_90d ~ rcs(cristal_cfs_score, 5) + age_on_admission, data = df0)
+
+  # Create bootstrapped dataset, use new models to predict on original dataset
+  boot[[i]] <- tibble(
+    participant_id = seq(1, nrow(df_pred), 1),
+    niter = i,
+    death_90d = df_pred$death_90d,
+    pred = predict(boot_fit1, newdata = df_pred, type = "fitted"),
+    pred2 = predict(boot_fit2, newdata = df_pred, type = "fitted"),
+    pred3 = predict(boot_fit3, newdata = df_pred, type = "fitted")
+  )
+}
+
+# Combine original predictions with bootstrapped model predictions
+df_boot <- full_join(
+  tibble(
+    participant_id = seq(1, nrow(df_pred), 1),
+    niter = 0,
+    death_90d = df_pred$death_90d,
+    pred = df_pred$pred,
+    pred2 = df_pred$pred2,
+    pred3 = df_pred$pred3
+  ),
+  do.call(rbind, boot)
+)
+
+remove(df0, boot, boot_fit1, boot_fit2, boot_fit3, boot_imp, i, N)
+
+p8 <- df_boot |> ggplot()
+
+p8 +
+  stat_plsmo(aes(x = pred, y = death_90d, group = niter, colour = "Base model"), alpha = 0.2) +
+  stat_plsmo(aes(x = pred2, y = death_90d, group = niter, colour = "Base model + age"), alpha = 0.2) +
+  stat_plsmo(aes(x = pred3, y = death_90d, group = niter, colour = "Non-linear CFS + age"), alpha = 0.2) +
+  geom_abline(colour = "red") +
+  scale_colour_manual(values = c("#56B4E9", "#E69F00", "#000000")) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank()) +
+  theme(legend.position = "bottom") +
+  theme(legend.title = element_blank()) +
+  labs(
+    x = "Predicted probability",
+    y = "Observed proportion"
+  )
+ggsave("./calibration_stability.png", height = 6, width = 6)
+
+MAPE <- df_boot |>
+  mutate(
+    error1 = abs(pred - df_pred$pred),
+    error2 = abs(pred2 - df_pred$pred2),
+    error3 = abs(pred3 - df_pred$pred3)
+  ) |>
+  group_by(participant_id) |>
+  summarise(
+    model1 = sum(error1) / B,
+    model2 = sum(error2) / B,
+    model3 = sum(error3) / B
+  ) |>
+  mutate(
+    pred = df_pred$pred,
+    pred2 = df_pred$pred2,
+    pred3 = df_pred$pred3
+  ) |>
+  ungroup()
+
+p9 <- MAPE |> ggplot()
+p9 +
+  geom_point(aes(x = pred, y = model1, colour = "Base model"), alpha = 0.3) +
+  geom_point(aes(x = pred2, y = model2, colour = "Base model + age"), alpha = 0.3) +
+  geom_point(aes(x = pred3, y = model2, colour = "Non-linear CFS + age"), alpha = 0.3) +
+  scale_colour_manual(values = c("#56B4E9", "#E69F00", "#000000")) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
+  scale_y_continuous(breaks = seq(0, 0.0002, 0.0001), limits = c(0, 0.0002)) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank()) +
+  theme(legend.position = "bottom") +
+  theme(legend.title = element_blank()) +
+  labs(
+    x = "Estimated risk from model",
+    y = "MAPE"
+  )
+ggsave("./mape_plot.png", height = 6, width = 6)
+```
+
+Neither plot shows anything to be worried about - the mean prediction error and mean calibration error are not detectable on our graphs. The total prediction error is also virtually 0, meaning model stability isn't really an issue here.
+
+```{r, echo = FALSE}
+paste0("MAPE, base model: ", sum(MAPE$model1) / (B * nrow(MAPE)))
+paste0("MAPE, base model + age: ", sum(MAPE$model2) / (B * nrow(MAPE)))
+paste0("MAPE, non-linear CFS + age: ", sum(MAPE$model3) / (B * nrow(MAPE)))
+```
