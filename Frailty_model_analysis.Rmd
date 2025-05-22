@@ -120,7 +120,7 @@ ggsurv$plot +
   annotate("label", label = 8, x = 401, y = 0.24, colour = colours[8]) +
   annotate("label", label = 9, x = 150, y = 0.12, colour = colours[9])
 
-ggsave("./Figure1.jpg", height = 6, width = 7)
+ggsave("./Figure1.tiff", height = 6, width = 7)
 remove(df_surv, fit_surv, ggsurv, colours, legend_labels)
 ```
 
@@ -347,9 +347,10 @@ Combining all three model performance plots to make them publication ready:
            x = 0.22, y = 0.9) +
   annotate(geom = "text",
            label = "Model overestimates risks",
-           x = 0.8, y = 0.1)
+           x = 0.8, y = 0.1) +
+plot_annotation(tag_levels = "A")
 
-ggsave("./Figure2.png", height = 10, width = 5)
+ggsave("./Figure2.tiff", height = 10, width = 5)
 
 ```
 
@@ -380,7 +381,7 @@ p6 +
     x = "Predicted probabilities of death within 90 days",
     y = "Number of observations"
   )
-ggsave("./Figure3.png", height = 5, width = 6)
+ggsave("./Figure3.tiff", height = 5, width = 6)
 ```
 
 We can also, finally, just check whether the net benefit is improved with this model.
@@ -410,7 +411,7 @@ as_tibble(dca(death_90d ~ `CFS alone` + `CFS + age` + `Non-linear CFS + age`, da
   annotate("text", label = "Using model not beneficial",
            x = 0.5, y = -0.02)
 
-ggsave("./Figure4.png", height = 6, width = 6)
+ggsave("./Figure4.tiff", height = 6, width = 6)
 ```
 
 Net benefit appears to be marginally better.
@@ -489,7 +490,7 @@ p8 +
     x = "Predicted probability",
     y = "Observed proportion"
   )
-ggsave("./calibration_stability.png", height = 6, width = 6)
+ggsave("./calibration_stability.tiff", height = 6, width = 6)
 
 MAPE <- df_boot |>
   mutate(
@@ -526,7 +527,7 @@ p9 +
     x = "Estimated risk from model",
     y = "MAPE"
   )
-ggsave("./mape_plot.png", height = 6, width = 6)
+ggsave("./mape_plot.tiff", height = 6, width = 6)
 ```
 
 Neither plot shows anything to be worried about - the mean prediction error and mean calibration error are not detectable on our graphs. The total prediction error is also virtually 0, meaning model stability isn't really an issue here.
